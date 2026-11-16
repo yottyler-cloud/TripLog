@@ -405,13 +405,70 @@ struct RouteMap: View {
     let fontReady: Bool
 
     var body: some View {
-        Canvas { ctx, size in
-            Self.render(&ctx, size: size, lines: lines, photos: photos, selectedID: selectedID,
-                        font: font, paper: paper)
+        GeometryReader { geo in
+            let layout = Self.layout(size: geo.size, lines: lines, photos: photos, selectedID: selectedID)
+            ZStack(alignment: .topLeading) {
+                // 地図（写真を選ぶと、その県を拡大した地図にふわっと切り替わる）
+                Canvas { ctx, _ in
+                    Self.draw(&ctx, layout: layout, lines: lines, font: font)
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .id(selectedID)
+                .transition(.opacity.combined(with: .scale(scale: 0.94)))
+
+                // 動く「ココ!」
+                if let dot = layout.selectedPoint, let rect = layout.kokoRect {
+                    KokoMark(rect: rect, dot: dot, radius: layout.dotRadius * 1.3, size: geo.size)
+                        .id(selectedID)
+                }
+            }
+            .animation(.easeInOut(duration: 0.35), value: selectedID)
         }
     }
 
-    // 県の数に合わせた置き場所（スケッチのように、ずらして並べる）
+    // MARK: 配置の計算
+
+    struct Fit {
+        let area: CGRect          // 範囲（経度・緯度）
+        let cosLat: CGFloat
+        let scale: CGFloat
+        let ox: CGFloat
+        let oy: CGFloat
+
+        func pt(_ lon: CGFloat, _ lat: CGFloat) -> CGPoint {
+            CGPoint(x: ox + (lon - area.minX) * cosLat * scale, y: oy + (area.maxY - lat) * scale)
+        }
+
+        static func make(area a: CGRect, into usable: CGRect) -> Fit {
+            let cosLat = CGFloat(cos(Double(a.midY) * .pi / 180))
+            let wDeg = max(a.width * cosLat, 0.0001), hDeg = max(a.height, 0.0001)
+            let scale = min(usable.width / wDeg, usable.height / hDeg)
+            return Fit(area: a, cosLat: cosLat, scale: scale,
+                       ox: usable.minX + (usable.width - wDeg * scale) / 2,
+                       oy: usable.minY + (usable.height - hDeg * scale) / 2)
+        }
+    }
+
+    struct DrawGroup {
+        let group: Int
+        let colorIndex: Int?      // 行った県なら色の番号、まわりの県は nil
+        let emphasized: Bool      // 拡大したときの主役の県
+    }
+
+    struct Layout {
+        var fits: [Int: Fit] = [:]
+        var backings: [[Int]] = []            // 影を付けて敷く白い紙（まとまりごと）
+        var drawGroups: [DrawGroup] = []
+        var labels: [(text: String, point: CGPoint)] = []
+        var points: [(id: UUID, number: Int, point: CGPoint)] = []
+        var dotRadius: CGFloat = 10
+        var labelSize: CGFloat = 18
+        var selectedID: UUID?
+        var selectedPoint: CGPoint?
+        var kokoRect: CGRect?
+        var clip: CGRect = .zero
+    }
+
     static func boxes(count n: Int, size: CGSize) -> [CGRect] {
         let w = size.width, h = size.height
         if n <= 1 { return [CGRect(origin: .zero, size: size)] }
@@ -426,21 +483,13 @@ struct RouteMap: View {
         }
     }
 
-    struct Fit {
-        let area: CGRect          // 県の範囲（経度・緯度）
-        let cosLat: CGFloat
-        let scale: CGFloat
-        let ox: CGFloat
-        let oy: CGFloat
-
-        func pt(_ lon: CGFloat, _ lat: CGFloat) -> CGPoint {
-            CGPoint(x: ox + (lon - area.minX) * cosLat * scale, y: oy + (area.maxY - lat) * scale)
-        }
-    }
-
-    static func render(_ ctx: inout GraphicsContext, size: CGSize, lines: [MapLine], photos: [TripPhoto],
-                       selectedID: UUID?, font: HandFont, paper: Color) {
-        guard !lines.isEmpty else { return }
+    static func layout(size: CGSize, lines: [MapLine], photos: [TripPhoto], selectedID: UUID?) -> Layout {
+        var L = Layout()
+        L.selectedID = selectedID
+        L.clip = CGRect(origin: .zero, size: size)
+        guard !lines.isEmpty, size.width > 0, size.height > 0 else { return L }
+        L.labelSize = max(14, min(28, min(size.width, size.height) * 0.06))
+        L.dotRadius = max(9, min(14, min(size.width, size.height) * 0.024))
 
         // 写真ごとの県と、行った順の県
         var groups: [Int] = []
@@ -452,68 +501,127 @@ struct RouteMap: View {
             if !groups.contains(g) { groups.append(g) }
             if groupName[g] == nil, !p.prefecture.isEmpty { groupName[g] = Trip.shortPrefecture(p.prefecture) }
         }
-        guard !groups.isEmpty else { return }
+        guard !groups.isEmpty else { return L }
 
-        let labelSize = max(14, min(28, min(size.width, size.height) * 0.06))
-
-        // 隣り合っている県をひとまとまりにする（境目の点が同じなら隣どうし）
-        var keyCache: [Int: Set<Int64>] = [:]
-        func pointKey(_ p: CGPoint) -> Int64 {
-            Int64((p.x * 1000).rounded()) * 100_000 + Int64((p.y * 1000).rounded())
-        }
-        func keys(_ g: Int) -> Set<Int64> {
-            if let k = keyCache[g] { return k }
-            var set = Set<Int64>()
-            for line in lines where line.group == g {
-                for p in line.points { set.insert(pointKey(p)) }
-            }
-            keyCache[g] = set
-            return set
-        }
-        func adjacent(_ a: Int, _ b: Int) -> Bool {
-            let ka = keys(a)
-            for line in lines where line.group == b {
-                for p in line.points where ka.contains(pointKey(p)) { return true }
-            }
-            return false
-        }
-        var clusters: [[Int]] = []
-        for g in groups {
-            var merged: [Int] = [g]
-            var rest: [[Int]] = []
-            for c in clusters {
-                if c.contains(where: { adjacent($0, g) }) { merged += c } else { rest.append(c) }
-            }
-            rest.append(merged)
-            clusters = rest
-        }
-        // 行った順に並べ直す
-        clusters.sort { a, b in
-            (a.compactMap { groups.firstIndex(of: $0) }.min() ?? 0) < (b.compactMap { groups.firstIndex(of: $0) }.min() ?? 0)
-        }
-
-        let boxRects = Self.boxes(count: clusters.count, size: size)
-
-        // まとまりごとに枠の中へ収める
-        var fits: [Int: Fit] = [:]
+        // 県ごとの範囲
         var groupAreas: [Int: CGRect] = [:]
-        for (i, cluster) in clusters.enumerated() {
-            var area: CGRect?
-            for line in lines where cluster.contains(line.group) {
-                let b = CGRect(x: line.minX, y: line.minY, width: line.maxX - line.minX, height: line.maxY - line.minY)
-                area = area?.union(b) ?? b
-                groupAreas[line.group] = groupAreas[line.group]?.union(b) ?? b
-            }
-            guard let a = area else { continue }
-            let usable = boxRects[min(i, boxRects.count - 1)].insetBy(dx: 12, dy: 12)
-            let cosLat = CGFloat(cos(Double(a.midY) * .pi / 180))
-            let wDeg = max(a.width * cosLat, 0.0001), hDeg = max(a.height, 0.0001)
-            let scale = min(usable.width / wDeg, usable.height / hDeg)
-            let ox = usable.minX + (usable.width - wDeg * scale) / 2
-            let oy = usable.minY + (usable.height - hDeg * scale) / 2
-            let fit = Fit(area: a, cosLat: cosLat, scale: scale, ox: ox, oy: oy)
-            for g in cluster { fits[g] = fit }
+        for line in lines where !line.isLake {
+            let b = CGRect(x: line.minX, y: line.minY, width: line.maxX - line.minX, height: line.maxY - line.minY)
+            groupAreas[line.group] = groupAreas[line.group]?.union(b) ?? b
         }
+
+        if let sel = selectedID, let target = photoGroup[sel], let targetArea = groupAreas[target] {
+            // ── 拡大：撮影した県を大きく。まわりの県も薄く描く
+            let area = targetArea.insetBy(dx: -targetArea.width * 0.08, dy: -targetArea.height * 0.08)
+            let fit = Fit.make(area: area, into: CGRect(origin: .zero, size: size).insetBy(dx: 14, dy: 14))
+            for (g, a) in groupAreas where a.intersects(area) {
+                L.fits[g] = fit
+                if g != target && !groups.contains(g) {
+                    L.drawGroups.append(DrawGroup(group: g, colorIndex: nil, emphasized: false))
+                }
+            }
+            for (i, g) in groups.enumerated() where L.fits[g] != nil && g != target {
+                L.drawGroups.append(DrawGroup(group: g, colorIndex: i, emphasized: false))
+            }
+            if let i = groups.firstIndex(of: target) {
+                L.backings = [[target]]
+                L.drawGroups.append(DrawGroup(group: target, colorIndex: i, emphasized: true))
+            }
+            for g in groups where L.fits[g] != nil {
+                if let name = groupName[g], let a = groupAreas[g] {
+                    let q = fit.pt(a.midX, a.midY)
+                    L.labels.append((name, CGPoint(x: q.x, y: q.y + L.labelSize * 1.2)))
+                }
+            }
+            L.labelSize *= 1.3
+            for (i, p) in photos.enumerated() {
+                guard let c = p.coordinate else { continue }
+                let q = fit.pt(CGFloat(c.longitude), CGFloat(c.latitude))
+                if L.clip.insetBy(dx: -20, dy: -20).contains(q) {
+                    L.points.append((p.id, i + 1, q))
+                }
+            }
+        } else {
+            // ── 全体：隣り合う県はつなげ、離れた県は別々にずらして並べる
+            var keyCache: [Int: Set<Int64>] = [:]
+            func pointKey(_ p: CGPoint) -> Int64 {
+                Int64((p.x * 1000).rounded()) * 100_000 + Int64((p.y * 1000).rounded())
+            }
+            func keys(_ g: Int) -> Set<Int64> {
+                if let k = keyCache[g] { return k }
+                var set = Set<Int64>()
+                for line in lines where line.group == g {
+                    for p in line.points { set.insert(pointKey(p)) }
+                }
+                keyCache[g] = set
+                return set
+            }
+            func adjacent(_ a: Int, _ b: Int) -> Bool {
+                let ka = keys(a)
+                for line in lines where line.group == b {
+                    for p in line.points where ka.contains(pointKey(p)) { return true }
+                }
+                return false
+            }
+            var clusters: [[Int]] = []
+            for g in groups {
+                var merged: [Int] = [g]
+                var rest: [[Int]] = []
+                for c in clusters {
+                    if c.contains(where: { adjacent($0, g) }) { merged += c } else { rest.append(c) }
+                }
+                rest.append(merged)
+                clusters = rest
+            }
+            clusters.sort { a, b in
+                (a.compactMap { groups.firstIndex(of: $0) }.min() ?? 0) < (b.compactMap { groups.firstIndex(of: $0) }.min() ?? 0)
+            }
+
+            let boxRects = boxes(count: clusters.count, size: size)
+            for (i, cluster) in clusters.enumerated() {
+                var area: CGRect?
+                for g in cluster {
+                    if let a = groupAreas[g] { area = area?.union(a) ?? a }
+                }
+                guard let a = area else { continue }
+                let fit = Fit.make(area: a, into: boxRects[min(i, boxRects.count - 1)].insetBy(dx: 12, dy: 12))
+                for g in cluster { L.fits[g] = fit }
+            }
+            L.backings = clusters
+            for (i, g) in groups.enumerated() {
+                L.drawGroups.append(DrawGroup(group: g, colorIndex: i, emphasized: false))
+                if let fit = L.fits[g], let name = groupName[g], let a = groupAreas[g] {
+                    let q = fit.pt(a.midX, a.midY)
+                    L.labels.append((name, CGPoint(x: q.x, y: q.y + L.labelSize * 0.9)))
+                }
+            }
+            for (i, p) in photos.enumerated() {
+                guard let g = photoGroup[p.id], let fit = L.fits[g], let c = p.coordinate else { continue }
+                L.points.append((p.id, i + 1, fit.pt(CGFloat(c.longitude), CGFloat(c.latitude))))
+            }
+        }
+
+        // 選んだ写真の点と「ココ!」の場所
+        if let sel = selectedID, let item = L.points.first(where: { $0.id == sel }),
+           let img = HandwritingAssets.koko, img.size.height > 0 {
+            let q = item.point
+            L.selectedPoint = q
+            let h = min(size.width, size.height) * 0.1
+            let w = h * img.size.width / img.size.height
+            var lx = q.x - w - h * 0.9
+            var ly = q.y - h * 2.4
+            if lx < 8 { lx = q.x + h * 0.9 }
+            lx = min(max(8, lx), size.width - w - 8)
+            ly = min(max(8, ly), size.height - h - 8)
+            L.kokoRect = CGRect(x: lx, y: ly, width: w, height: h)
+        }
+        return L
+    }
+
+    // MARK: 描く
+
+    static func draw(_ ctx: inout GraphicsContext, layout L: Layout, lines: [MapLine], font: HandFont) {
+        guard !L.fits.isEmpty else { return }
 
         func ring(_ line: MapLine, _ fit: Fit) -> Path {
             var path = Path()
@@ -524,62 +632,63 @@ struct RouteMap: View {
             path.closeSubpath()
             return path
         }
+        func groupPath(_ g: Int) -> Path {
+            var path = Path()
+            guard let fit = L.fits[g] else { return path }
+            for line in lines where line.group == g { path.addPath(ring(line, fit)) }
+            return path
+        }
 
-        // 県の形（まとまりごとに影を付けて、県ごとに色を変える）
-        for cluster in clusters {
+        // まわりの県（拡大のとき）
+        for d in L.drawGroups where d.colorIndex == nil {
+            let path = groupPath(d.group)
+            ctx.fill(path, with: .color(.white.opacity(0.45)), style: FillStyle(eoFill: true))
+            ctx.stroke(path, with: .color(NoteInk.ink2.opacity(0.6)), style: StrokeStyle(lineWidth: 1, lineJoin: .round))
+        }
+
+        // 影を付けた白い紙
+        for backing in L.backings {
             var outline = Path()
-            for g in cluster {
-                guard let fit = fits[g] else { continue }
-                for line in lines where line.group == g { outline.addPath(ring(line, fit)) }
-            }
+            for g in backing { outline.addPath(groupPath(g)) }
             var shadowCtx = ctx
             shadowCtx.addFilter(.shadow(color: .black.opacity(0.25), radius: 4, x: 1, y: 3))
             shadowCtx.fill(outline, with: .color(.white.opacity(0.9)), style: FillStyle(eoFill: true))
         }
-        for (i, g) in groups.enumerated() {
-            guard let fit = fits[g] else { continue }
-            var path = Path()
-            for line in lines where line.group == g {
-                path.addPath(ring(line, fit))
-            }
-            ctx.fill(path, with: .color(NoteInk.fills[i % NoteInk.fills.count]), style: FillStyle(eoFill: true))
-            ctx.stroke(path, with: .color(NoteInk.ink), style: StrokeStyle(lineWidth: 1.8, lineJoin: .round))
+
+        // 行った県（色を付ける）
+        for d in L.drawGroups {
+            guard let ci = d.colorIndex, let fit = L.fits[d.group] else { continue }
+            let path = groupPath(d.group)
+            ctx.fill(path, with: .color(NoteInk.fills[ci % NoteInk.fills.count]), style: FillStyle(eoFill: true))
+            ctx.stroke(path, with: .color(NoteInk.ink),
+                       style: StrokeStyle(lineWidth: d.emphasized ? 2.6 : 1.8, lineJoin: .round))
 
             // 県の中の湖
             for line in lines where line.isLake {
                 let c = CLLocationCoordinate2D(latitude: Double((line.minY + line.maxY) / 2),
                                                longitude: Double((line.minX + line.maxX) / 2))
                 guard fit.area.contains(CGPoint(x: c.longitude, y: c.latitude)),
-                      MapData.prefectureGroup(at: c, lines: lines) == g else { continue }
+                      MapData.prefectureGroup(at: c, lines: lines) == d.group else { continue }
                 let lake = ring(line, fit)
                 ctx.fill(lake, with: .color(Color(red: 0.86, green: 0.93, blue: 0.98)))
                 ctx.stroke(lake, with: .color(NoteInk.ink), style: StrokeStyle(lineWidth: 1.2, lineJoin: .round))
             }
         }
 
-        // 県の名前（手書き風、県の真ん中あたり）
-        for g in groups {
-            guard let fit = fits[g], let ga = groupAreas[g], let name = groupName[g] else { continue }
-            let q = fit.pt(ga.midX, ga.midY)
-            ctx.draw(Text(name)
-                        .font(FontStore.shared.font(font, size: labelSize))
+        // 県の名前（手書き風）
+        for label in L.labels {
+            ctx.draw(Text(label.text)
+                        .font(FontStore.shared.font(font, size: L.labelSize))
                         .foregroundColor(NoteInk.ink),
-                     at: CGPoint(x: q.x, y: q.y + labelSize * 0.9))
+                     at: label.point)
         }
 
-        // 撮影地の点の位置（撮影順）
-        var points: [(id: UUID, number: Int, point: CGPoint)] = []
-        for (i, p) in photos.enumerated() {
-            guard let g = photoGroup[p.id], let fit = fits[g], let c = p.coordinate else { continue }
-            points.append((p.id, i + 1, fit.pt(CGFloat(c.longitude), CGFloat(c.latitude))))
-        }
-
-        let r = max(9, min(14, min(size.width, size.height) * 0.024))
+        let r = L.dotRadius
 
         // 道のり（赤い点線と矢印）
-        if points.count >= 2 {
-            for k in 1..<points.count {
-                let a = points[k - 1].point, b = points[k].point
+        if L.points.count >= 2 {
+            for k in 1..<L.points.count {
+                let a = L.points[k - 1].point, b = L.points[k].point
                 let dx = b.x - a.x, dy = b.y - a.y
                 let len = sqrt(dx * dx + dy * dy)
                 guard len > r * 2.6 else { continue }
@@ -594,7 +703,6 @@ struct RouteMap: View {
                 ctx.stroke(path, with: .color(NoteInk.red),
                            style: StrokeStyle(lineWidth: 2.4, lineCap: .round, dash: [6, 6]))
 
-                // 矢じり
                 let ex = end.x - control.x, ey = end.y - control.y
                 let el = max(sqrt(ex * ex + ey * ey), 0.001)
                 let bx = -ex / el, by = -ey / el
@@ -612,14 +720,13 @@ struct RouteMap: View {
             }
         }
 
-        // 番号の点
-        var selectedPoint: CGPoint?
-        for item in points {
+        // 番号の点（選んだ写真の点は最後に大きく）
+        let ordered = L.points.filter { $0.id != L.selectedID } + L.points.filter { $0.id == L.selectedID }
+        for item in ordered {
             let q = item.point
-            let isSelected = item.id == selectedID
+            let isSelected = item.id == L.selectedID
             let rr = isSelected ? r * 1.3 : r
             if isSelected {
-                selectedPoint = q
                 ctx.fill(Path(ellipseIn: CGRect(x: q.x - rr - 3, y: q.y - rr - 3, width: (rr + 3) * 2, height: (rr + 3) * 2)),
                          with: .color(.white))
             }
@@ -630,24 +737,61 @@ struct RouteMap: View {
                         .foregroundColor(.white),
                      at: q)
         }
+    }
+}
 
-        // タッチした写真の場所に「ココ!」
-        if let q = selectedPoint, let img = HandwritingAssets.koko, img.size.height > 0 {
-            let h = min(size.width, size.height) * 0.1
-            let w = h * img.size.width / img.size.height
-            var lx = q.x - w - h * 0.9
-            var ly = q.y - h * 2.4
-            if lx < 8 { lx = q.x + h * 0.9 }
-            lx = min(max(8, lx), size.width - w - 8)
-            ly = min(max(8, ly), size.height - h - 8)
-            let rect = CGRect(x: lx, y: ly, width: w, height: h)
-            if let arrow = HereArrow.path(from: rect, to: q, dotRadius: r * 0.6, width: h * 0.09) {
-                ctx.stroke(Path(arrow), with: .color(NoteInk.red),
-                           style: StrokeStyle(lineWidth: h * 0.09, lineCap: .round, lineJoin: .round))
+// 動く「ココ!」（撮影地に向かってぴょこぴょこ動き、点のまわりに波紋が広がる）
+struct KokoMark: View {
+    let rect: CGRect
+    let dot: CGPoint
+    let radius: CGFloat
+    let size: CGSize
+
+    @State private var bob = false
+    @State private var pulse = false
+    @State private var shown = false
+
+    var body: some View {
+        let dx = dot.x - rect.midX, dy = dot.y - rect.midY
+        let len = max(sqrt(dx * dx + dy * dy), 1)
+        let ux = dx / len, uy = dy / len
+        let amp = rect.height * 0.14
+
+        ZStack(alignment: .topLeading) {
+            // 撮影地の波紋
+            Circle()
+                .stroke(NoteInk.red, lineWidth: 3)
+                .frame(width: radius * 2.4, height: radius * 2.4)
+                .scaleEffect(pulse ? 2.4 : 1)
+                .opacity(pulse ? 0 : 0.9)
+                .position(dot)
+
+            // 手書きの「ココ!」と矢印
+            ZStack(alignment: .topLeading) {
+                if let arrow = HereArrow.path(from: rect, to: dot, dotRadius: radius * 0.6, width: rect.height * 0.09) {
+                    Path(arrow)
+                        .stroke(NoteInk.red, style: StrokeStyle(lineWidth: rect.height * 0.09, lineCap: .round, lineJoin: .round))
+                }
+                if let img = HandwritingAssets.koko {
+                    Image(uiImage: img)
+                        .renderingMode(.template)
+                        .resizable()
+                        .foregroundStyle(NoteInk.red)
+                        .frame(width: rect.width, height: rect.height)
+                        .rotationEffect(.degrees(bob ? 4 : -4))
+                        .position(x: rect.midX, y: rect.midY)
+                }
             }
-            var resolved = ctx.resolve(Image(uiImage: img).renderingMode(.template))
-            resolved.shading = .color(NoteInk.red)
-            ctx.draw(resolved, in: rect)
+            .frame(width: size.width, height: size.height, alignment: .topLeading)
+            .offset(x: bob ? ux * amp : -ux * amp * 0.3, y: bob ? uy * amp : -uy * amp * 0.3)
+            .opacity(shown ? 1 : 0)
+        }
+        .frame(width: size.width, height: size.height, alignment: .topLeading)
+        .allowsHitTesting(false)
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.3)) { shown = true }
+            withAnimation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true)) { bob = true }
+            withAnimation(.easeOut(duration: 1.2).repeatForever(autoreverses: false)) { pulse = true }
         }
     }
 }
