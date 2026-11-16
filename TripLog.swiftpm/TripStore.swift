@@ -10,6 +10,9 @@ struct TripPhoto: Codable, Identifiable, Equatable {
     var prefecture = ""          // 例：福島県
     var city = ""                // 例：いわき市
     var added = Date()           // ノートに入れた日時（撮影日時がないときの並び順）
+    var transport: Int?          // 1つ前の写真からここまでの移動手段（Transport の番号）
+
+    var transportMode: Transport { Transport(rawValue: transport ?? 0) ?? .car }
 
     var coordinate: CLLocationCoordinate2D? {
         guard let latitude, let longitude else { return nil }
@@ -21,6 +24,37 @@ struct TripPhoto: Codable, Identifiable, Equatable {
 
     // 並べる順番（撮影日時の順）
     var sortDate: Date { taken ?? added }
+}
+
+// 移動手段
+enum Transport: Int, CaseIterable {
+    case car, train, shinkansen, bus, bike, plane, ship, walk
+
+    var name: String {
+        switch self {
+        case .car: return "車"
+        case .train: return "電車"
+        case .shinkansen: return "新幹線"
+        case .bus: return "バス"
+        case .bike: return "バイク"
+        case .plane: return "飛行機"
+        case .ship: return "船"
+        case .walk: return "徒歩"
+        }
+    }
+
+    var emoji: String {
+        switch self {
+        case .car: return "🚗"
+        case .train: return "🚃"
+        case .shinkansen: return "🚄"
+        case .bus: return "🚌"
+        case .bike: return "🏍️"
+        case .plane: return "✈️"
+        case .ship: return "🚢"
+        case .walk: return "🚶"
+        }
+    }
 }
 
 // 紙の色
@@ -178,6 +212,14 @@ final class TripStore: ObservableObject {
             trips[i] = trip
         } else {
             trips.insert(trip, at: 0)
+        }
+    }
+
+    func setTransport(_ mode: Transport, photoIDs: [UUID], in tripID: UUID) {
+        update(tripID) { t in
+            for i in t.photos.indices where photoIDs.contains(t.photos[i].id) {
+                t.photos[i].transport = mode.rawValue
+            }
         }
     }
 

@@ -73,6 +73,8 @@ struct NotebookView: View {
     @State private var undoTick = 0
     @State private var pageSize: CGSize = .zero
     @State private var exported: RenderResult?
+    @State private var travel: TravelInfo?
+    @State private var showTransport = false
 
     var trip: Trip? { store.trip(tripID) }
 
@@ -112,12 +114,16 @@ struct NotebookView: View {
         .fullScreenCover(item: $exported) { r in
             ResultView(result: r)
         }
+        .sheet(isPresented: $showTransport) {
+            if let trip { TransportSheet(trip: trip) }
+        }
         .confirmationDialog("この写真をノートから外しますか？",
                             isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
                             titleVisibility: .visible) {
             Button("外す", role: .destructive) {
                 if let p = removing {
                     store.removePhoto(p, from: tripID)
+                    travel = nil
                     selectedID = nil
                 }
                 removing = nil
@@ -186,7 +192,16 @@ struct NotebookView: View {
             .buttonStyle(.bordered)
 
             Button {
+                showTransport = true
+            } label: {
+                Label("移動手段", systemImage: "car.fill")
+            }
+            .buttonStyle(.bordered)
+            .disabled((trip?.photos.count ?? 0) < 2)
+
+            Button {
                 penMode.toggle()
+                travel = nil
                 selectedID = nil
             } label: {
                 Label(penMode ? "ペンを終わる" : "ペン", systemImage: "pencil.tip")
@@ -256,9 +271,10 @@ struct NotebookView: View {
             : CGRect(x: 0, y: rects.photos.minY - 12, width: size.width, height: size.height - rects.photos.minY + 12)
         return ZStack(alignment: .topLeading) {
             NotebookPage(trip: trip, lines: maps.lines, size: size, selectedID: selectedID,
+                         travel: travel,
                          fontReady: fonts.registeredNames[trip.font] != nil,
                          editable: !penMode,
-                         onTapPhoto: { p in selectedID = p.id })
+                         onTapPhoto: { p in travel = nil; selectedID = p.id })
 
             // 手書きメモ（ペンのときだけ書ける）
             DrawingCanvas(drawing: $drawing, isActive: penMode, tool: pen.pkTool, undoTick: undoTick)
@@ -270,16 +286,38 @@ struct NotebookView: View {
                 let photo = sorted[index]
                 EnlargedPhoto(image: store.thumbnail(tripID, photo), number: index + 1, total: sorted.count,
                               photo: photo, font: trip.font,
-                              onPrev: index > 0 ? { selectedID = sorted[index - 1].id } : nil,
-                              onNext: index < sorted.count - 1 ? { selectedID = sorted[index + 1].id } : nil,
+                              arrivedBy: index > 0 ? photo.transportMode : nil,
+                              onTransport: { m in store.setTransport(m, photoIDs: [photo.id], in: tripID) },
+                              onPrev: index > 0 ? { go(to: index - 1, in: sorted) } : nil,
+                              onNext: index < sorted.count - 1 ? { go(to: index + 1, in: sorted) } : nil,
                               onRemove: { removing = photo },
-                              onClose: { selectedID = nil })
+                              onClose: { travel = nil; selectedID = nil })
                     .frame(width: overlay.width, height: overlay.height)
                     .offset(x: overlay.minX, y: overlay.minY)
             }
         }
         .frame(width: size.width, height: size.height, alignment: .topLeading)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    // 前後の写真へ。となりの写真なら、地図の上を乗り物が移動する
+    func go(to index: Int, in sorted: [TripPhoto]) {
+        let next = sorted[index]
+        if let cur = selectedID, let ci = sorted.firstIndex(where: { $0.id == cur }), abs(ci - index) == 1,
+           let a = sorted[ci].coordinate, let b = next.coordinate,
+           abs(a.latitude - b.latitude) + abs(a.longitude - b.longitude) > 0.003 {
+            let mode = sorted[max(ci, index)].transportMode     // あとの写真に登録した手段
+            let duration = mode == .plane ? 2.4 : 2.0
+            let info = TravelInfo(from: cur, to: next.id, mode: mode,
+                                  begin: Date().addingTimeInterval(0.4), duration: duration)
+            travel = info
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4 + duration + 0.5) {
+                if travel?.token == info.token { travel = nil }
+            }
+        } else {
+            travel = nil
+        }
+        selectedID = next.id
     }
 
     // MARK: - 写真の追加・手書き・書き出し
@@ -344,6 +382,7 @@ struct NotebookPage: View {
     let lines: [MapLine]
     let size: CGSize
     var selectedID: UUID? = nil
+    var travel: TravelInfo? = nil
     var fontReady = false          // フォントが読み込まれたら描き直すための目印
     var editable = false
     var onTapPhoto: ((TripPhoto) -> Void)? = nil
@@ -381,7 +420,7 @@ struct NotebookPage: View {
                 .offset(x: rects.date.x, y: rects.date.y)
 
             // 県の地図と道のり
-            RouteMap(lines: lines, photos: sorted, selectedID: selectedID, font: trip.font,
+            RouteMap(lines: lines, photos: sorted, selectedID: selectedID, travel: travel, font: trip.font,
                      paper: trip.paper.color, fontReady: fontReady)
                 .frame(width: rects.map.width, height: rects.map.height)
                 .offset(x: rects.map.minX, y: rects.map.minY)
@@ -402,29 +441,46 @@ struct RouteMap: View {
     let lines: [MapLine]
     let photos: [TripPhoto]       // 撮影日時の順
     let selectedID: UUID?
+    var travel: TravelInfo? = nil
     let font: HandFont
     let paper: Color
     let fontReady: Bool
 
+    // 地図を切り替える目印（移動中は出発地と到着地が入る地図）
+    var mapKey: String {
+        if let t = travel { return "travel-\(t.token.uuidString)" }
+        return selectedID?.uuidString ?? "all"
+    }
+
     var body: some View {
         GeometryReader { geo in
-            let layout = Self.layout(size: geo.size, lines: lines, photos: photos, selectedID: selectedID)
+            let layout = Self.layout(size: geo.size, lines: lines, photos: photos, selectedID: selectedID,
+                                     travel: travel.map { (from: $0.from, to: $0.to) })
             ZStack(alignment: .topLeading) {
                 // 地図（写真を選ぶと、その県を拡大した地図にふわっと切り替わる）
                 Canvas { ctx, _ in
                     Self.draw(&ctx, layout: layout, lines: lines, font: font)
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
-                .id(selectedID)
+                .id(mapKey)
                 .transition(.opacity.combined(with: .scale(scale: 0.94)))
 
+                // 移動する乗り物
+                if let t = travel, let a = layout.travelA, let b = layout.travelB {
+                    TravelMark(a: a.point, b: b.point, reverse: a.id != t.from, mode: t.mode,
+                               begin: t.begin, duration: t.duration,
+                               iconSize: layout.dotRadius * 2.6, canvas: geo.size)
+                        .id(t.token)
+                        .transition(.opacity)
+                }
+
                 // 動く「ココ!」
-                if let dot = layout.selectedPoint, let rect = layout.kokoRect {
+                if travel == nil, let dot = layout.selectedPoint, let rect = layout.kokoRect {
                     KokoMark(rect: rect, dot: dot, radius: layout.dotRadius * 1.3, size: geo.size)
                         .id(selectedID)
                 }
             }
-            .animation(.easeInOut(duration: 0.35), value: selectedID)
+            .animation(.easeInOut(duration: 0.35), value: mapKey)
         }
     }
 
@@ -469,6 +525,8 @@ struct RouteMap: View {
         var selectedPoint: CGPoint?
         var kokoRect: CGRect?
         var clip: CGRect = .zero
+        var travelA: (id: UUID, point: CGPoint)?   // 移動の区間（撮影順で前の写真）
+        var travelB: (id: UUID, point: CGPoint)?   // 移動の区間（撮影順で後の写真）
     }
 
     static func boxes(count n: Int, size: CGSize) -> [CGRect] {
@@ -485,7 +543,8 @@ struct RouteMap: View {
         }
     }
 
-    static func layout(size: CGSize, lines: [MapLine], photos: [TripPhoto], selectedID: UUID?) -> Layout {
+    static func layout(size: CGSize, lines: [MapLine], photos: [TripPhoto], selectedID: UUID?,
+                       travel: (from: UUID, to: UUID)? = nil) -> Layout {
         var L = Layout()
         L.selectedID = selectedID
         L.clip = CGRect(origin: .zero, size: size)
@@ -525,22 +584,35 @@ struct RouteMap: View {
             groupAreas[g] = groupAreas[g]?.union(spot) ?? spot
         }
 
-        if let sel = selectedID, let target = photoGroup[sel], let targetArea = groupAreas[target] {
+        // 拡大する県（移動中は出発地と到着地の両方）
+        let focusIDs: [UUID] = travel.map { [$0.from, $0.to] } ?? (selectedID.map { [$0] } ?? [])
+        var targets: [Int] = []
+        for id in focusIDs {
+            if let g = photoGroup[id], !targets.contains(g) { targets.append(g) }
+        }
+        var targetArea: CGRect?
+        for g in targets {
+            if let a = groupAreas[g] { targetArea = targetArea?.union(a) ?? a }
+        }
+
+        if let targetArea {
             // ── 拡大：撮影した県を大きく。まわりの県も薄く描く
             let area = targetArea.insetBy(dx: -targetArea.width * 0.08, dy: -targetArea.height * 0.08)
             let fit = Fit.make(area: area, into: CGRect(origin: .zero, size: size).insetBy(dx: 14, dy: 14))
             for (g, a) in groupAreas where a.intersects(area) {
                 L.fits[g] = fit
-                if g != target && !groups.contains(g) {
+                if !targets.contains(g) && !groups.contains(g) {
                     L.drawGroups.append(DrawGroup(group: g, colorIndex: nil, emphasized: false))
                 }
             }
-            for (i, g) in groups.enumerated() where L.fits[g] != nil && g != target {
+            for (i, g) in groups.enumerated() where L.fits[g] != nil && !targets.contains(g) {
                 L.drawGroups.append(DrawGroup(group: g, colorIndex: i, emphasized: false))
             }
-            if let i = groups.firstIndex(of: target) {
-                L.backings = [[target]]
-                L.drawGroups.append(DrawGroup(group: target, colorIndex: i, emphasized: true))
+            L.backings = [targets]
+            for target in targets {
+                if let i = groups.firstIndex(of: target) {
+                    L.drawGroups.append(DrawGroup(group: target, colorIndex: i, emphasized: true))
+                }
             }
             for g in groups where L.fits[g] != nil {
                 if let name = groupName[g], let a = groupAreas[g] {
@@ -548,7 +620,7 @@ struct RouteMap: View {
                     L.labels.append((name, CGPoint(x: q.x, y: q.y + L.labelSize * 1.2)))
                 }
             }
-            L.labelSize *= 1.3
+            if targets.count == 1 { L.labelSize *= 1.3 }
             for (i, p) in photos.enumerated() {
                 guard let c = p.coordinate else { continue }
                 let q = fit.pt(CGFloat(c.longitude), CGFloat(c.latitude))
@@ -613,6 +685,15 @@ struct RouteMap: View {
             for (i, p) in photos.enumerated() {
                 guard let g = photoGroup[p.id], let fit = L.fits[g], let c = p.coordinate else { continue }
                 L.points.append((p.id, i + 1, fit.pt(CGFloat(c.longitude), CGFloat(c.latitude))))
+            }
+        }
+
+        // 移動の区間（撮影順に並べる）
+        if let travel {
+            let pair = L.points.filter { $0.id == travel.from || $0.id == travel.to }.sorted { $0.number < $1.number }
+            if pair.count == 2 {
+                L.travelA = (pair[0].id, pair[0].point)
+                L.travelB = (pair[1].id, pair[1].point)
             }
         }
 
@@ -759,6 +840,97 @@ struct RouteMap: View {
     }
 }
 
+// 写真から写真への移動（スワイプしたときの乗り物アニメーション）
+struct TravelInfo: Equatable {
+    let token = UUID()
+    let from: UUID
+    let to: UUID
+    let mode: Transport
+    let begin: Date
+    let duration: Double
+}
+
+// 赤い点線の上を、乗り物が走っていく
+struct TravelMark: View {
+    let a: CGPoint            // 撮影順で前の点
+    let b: CGPoint            // 撮影順で後の点
+    let reverse: Bool         // 後ろの写真へ戻るときは逆向きに走る
+    let mode: Transport
+    let begin: Date
+    let duration: Double
+    let iconSize: CGFloat
+    let canvas: CGSize
+
+    // 地図の点線と同じ曲がり方
+    var control: CGPoint {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let len = max(sqrt(dx * dx + dy * dy), 0.001)
+        let bow = min(len * 0.18, 60)
+        return CGPoint(x: (a.x + b.x) / 2 - dy / len * bow, y: (a.y + b.y) / 2 + dx / len * bow)
+    }
+
+    func point(_ t: CGFloat) -> CGPoint {
+        let c = control, u = 1 - t
+        return CGPoint(x: u * u * a.x + 2 * u * t * c.x + t * t * b.x,
+                       y: u * u * a.y + 2 * u * t * c.y + t * t * b.y)
+    }
+
+    func direction(_ t: CGFloat) -> CGVector {
+        let c = control
+        var v = CGVector(dx: 2 * (1 - t) * (c.x - a.x) + 2 * t * (b.x - c.x),
+                         dy: 2 * (1 - t) * (c.y - a.y) + 2 * t * (b.y - c.y))
+        if reverse { v = CGVector(dx: -v.dx, dy: -v.dy) }
+        return v
+    }
+
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let raw = CGFloat(min(max(timeline.date.timeIntervalSince(begin) / duration, 0), 1))
+            let eased = raw < 0.5 ? 2 * raw * raw : 1 - pow(-2 * raw + 2, 2) / 2
+            let t = reverse ? 1 - eased : eased
+            let p = point(t)
+            let v = direction(t)
+            let heading = atan2(v.dy, v.dx)
+            let goingRight = v.dx > 0
+
+            // 絵文字の向きに合わせて回す（飛行機は右上向き、ほかは左向きの絵）
+            let angle: CGFloat = {
+                if mode == .plane { return heading + .pi / 4 }
+                var r = goingRight ? heading : heading - .pi
+                while r > .pi { r -= 2 * .pi }
+                while r < -.pi { r += 2 * .pi }
+                return min(max(r, -0.45), 0.45)
+            }()
+            // 飛行機は途中で大きく（高く飛ぶ感じ）、ほかは小さく揺れる
+            let lift: CGFloat = mode == .plane ? 1 + 0.45 * sin(.pi * eased) : 1
+            let bounce: CGFloat = mode == .plane ? 0 : sin(raw * .pi * 10) * iconSize * 0.05
+
+            let trail = Path { path in
+                path.move(to: a)
+                path.addQuadCurve(to: b, control: control)
+            }
+
+            ZStack(alignment: .topLeading) {
+                // 走ったところは太い赤線に
+                trail.trimmedPath(from: reverse ? t : 0, to: reverse ? 1 : t)
+                    .stroke(NoteInk.red, style: StrokeStyle(lineWidth: 4.5, lineCap: .round))
+
+                Text(mode.emoji)
+                    .font(.system(size: iconSize * 0.62))
+                    .scaleEffect(x: (mode != .plane && goingRight) ? -1 : 1, y: 1)
+                    .rotationEffect(.radians(Double(angle)))
+                    .frame(width: iconSize, height: iconSize)
+                    .background(Circle().fill(.white).shadow(color: .black.opacity(0.3), radius: 3, y: 2))
+                    .overlay(Circle().stroke(NoteInk.red, lineWidth: 2))
+                    .scaleEffect(lift)
+                    .position(x: p.x, y: p.y - iconSize * 0.15 + bounce)
+            }
+            .frame(width: canvas.width, height: canvas.height, alignment: .topLeading)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
 // 動く「ココ!」（撮影地に向かってぴょこぴょこ動き、点のまわりに波紋が広がる）
 struct KokoMark: View {
     let rect: CGRect
@@ -896,6 +1068,8 @@ struct EnlargedPhoto: View {
     let total: Int
     let photo: TripPhoto
     let font: HandFont
+    let arrivedBy: Transport?              // 1枚目は nil
+    let onTransport: (Transport) -> Void
     let onPrev: (() -> Void)?
     let onNext: (() -> Void)?
     let onRemove: () -> Void
@@ -966,6 +1140,25 @@ struct EnlargedPhoto: View {
                         .lineLimit(2)
                         .minimumScaleFactor(0.7)
                     Spacer()
+                    // 前の写真からここまでの移動手段
+                    if let arrivedBy {
+                        Menu {
+                            ForEach(Transport.allCases, id: \.self) { m in
+                                Button {
+                                    onTransport(m)
+                                } label: {
+                                    Text("\(m.emoji) \(m.name)" + (m == arrivedBy ? "  ✓" : ""))
+                                }
+                            }
+                        } label: {
+                            Text("\(number - 1)→\(number)  \(arrivedBy.emoji) \(arrivedBy.name)")
+                                .font(.callout)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Capsule().fill(Color(white: 0.92)))
+                                .foregroundStyle(NoteInk.ink)
+                        }
+                    }
                 }
 
                 HStack(spacing: 10) {
@@ -1008,6 +1201,87 @@ struct EnlargedPhoto: View {
             .shadow(color: .black.opacity(0.35), radius: 14, y: 6)
             .padding(24)
         }
+    }
+}
+
+// MARK: - 移動手段をまとめて登録する画面
+
+struct TransportSheet: View {
+    let trip: Trip
+    @ObservedObject private var store = TripStore.shared
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let current = store.trip(trip.id) ?? trip
+        let sorted = current.sortedPhotos
+        NavigationStack {
+            List {
+                Section {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Transport.allCases, id: \.self) { m in
+                                Button {
+                                    store.setTransport(m, photoIDs: sorted.dropFirst().map(\.id), in: trip.id)
+                                } label: {
+                                    Text("\(m.emoji) \(m.name)")
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                } header: {
+                    Text("全部まとめて")
+                } footer: {
+                    Text("写真を左右にスワイプすると、ここで選んだ乗り物が地図の上を移動します。")
+                }
+
+                Section("区間ごと") {
+                    ForEach(Array(sorted.enumerated()).dropFirst(), id: \.element.id) { index, photo in
+                        let prev = sorted[index - 1]
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("\(index) → \(index + 1)")
+                                    .font(.headline.monospacedDigit())
+                                Text("\(Self.place(prev)) → \(Self.place(photo))")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    ForEach(Transport.allCases, id: \.self) { m in
+                                        let on = photo.transportMode == m
+                                        Button {
+                                            store.setTransport(m, photoIDs: [photo.id], in: trip.id)
+                                        } label: {
+                                            Text("\(m.emoji) \(m.name)")
+                                                .font(.subheadline)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(on ? .orange : nil)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            .navigationTitle("移動手段")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完了") { dismiss() }
+                }
+            }
+        }
+    }
+
+    static func place(_ p: TripPhoto) -> String {
+        if !p.city.isEmpty { return p.city }
+        if !p.prefecture.isEmpty { return p.prefecture }
+        return "場所不明"
     }
 }
 
