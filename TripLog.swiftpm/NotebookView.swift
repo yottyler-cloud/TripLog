@@ -364,7 +364,13 @@ struct NotebookPage: View {
         let sorted = trip.sortedPhotos
         let dateSize = min(size.width, size.height) * 0.045
         ZStack(alignment: .topLeading) {
-            trip.paper.color
+            if trip.paper.isCork {
+                Image(uiImage: CorkTexture.image(size: size))
+                    .resizable()
+                    .frame(width: size.width, height: size.height)
+            } else {
+                trip.paper.color
+            }
 
             // 左上の日付
             Text(trip.photos.isEmpty ? "旅の写真を入れてください" : (trip.dateRangeJa.isEmpty ? trip.title : trip.dateRangeJa))
@@ -379,7 +385,7 @@ struct NotebookPage: View {
                 .offset(x: rects.map.minX, y: rects.map.minY)
 
             // 写真
-            PhotoGrid(trip: trip, photos: sorted, size: rects.photos.size, onTap: onTapPhoto)
+            PhotoGrid(trip: trip, photos: sorted, size: rects.photos.size, pinned: trip.paper.isCork, onTap: onTapPhoto)
                 .frame(width: rects.photos.width, height: rects.photos.height)
                 .offset(x: rects.photos.minX, y: rects.photos.minY)
                 .allowsHitTesting(editable)
@@ -449,27 +455,64 @@ struct RouteMap: View {
         guard !groups.isEmpty else { return }
 
         let labelSize = max(14, min(28, min(size.width, size.height) * 0.06))
-        let boxes = boxes(count: groups.count, size: size)
 
-        // 県ごとに枠の中へ収める
-        var fits: [Int: Fit] = [:]
-        var shapeRects: [Int: CGRect] = [:]
-        for (i, g) in groups.enumerated() {
-            var area: CGRect?
+        // 隣り合っている県をひとまとまりにする（境目の点が同じなら隣どうし）
+        var keyCache: [Int: Set<Int64>] = [:]
+        func pointKey(_ p: CGPoint) -> Int64 {
+            Int64((p.x * 1000).rounded()) * 100_000 + Int64((p.y * 1000).rounded())
+        }
+        func keys(_ g: Int) -> Set<Int64> {
+            if let k = keyCache[g] { return k }
+            var set = Set<Int64>()
             for line in lines where line.group == g {
+                for p in line.points { set.insert(pointKey(p)) }
+            }
+            keyCache[g] = set
+            return set
+        }
+        func adjacent(_ a: Int, _ b: Int) -> Bool {
+            let ka = keys(a)
+            for line in lines where line.group == b {
+                for p in line.points where ka.contains(pointKey(p)) { return true }
+            }
+            return false
+        }
+        var clusters: [[Int]] = []
+        for g in groups {
+            var merged: [Int] = [g]
+            var rest: [[Int]] = []
+            for c in clusters {
+                if c.contains(where: { adjacent($0, g) }) { merged += c } else { rest.append(c) }
+            }
+            rest.append(merged)
+            clusters = rest
+        }
+        // 行った順に並べ直す
+        clusters.sort { a, b in
+            (a.compactMap { groups.firstIndex(of: $0) }.min() ?? 0) < (b.compactMap { groups.firstIndex(of: $0) }.min() ?? 0)
+        }
+
+        let boxRects = Self.boxes(count: clusters.count, size: size)
+
+        // まとまりごとに枠の中へ収める
+        var fits: [Int: Fit] = [:]
+        var groupAreas: [Int: CGRect] = [:]
+        for (i, cluster) in clusters.enumerated() {
+            var area: CGRect?
+            for line in lines where cluster.contains(line.group) {
                 let b = CGRect(x: line.minX, y: line.minY, width: line.maxX - line.minX, height: line.maxY - line.minY)
                 area = area?.union(b) ?? b
+                groupAreas[line.group] = groupAreas[line.group]?.union(b) ?? b
             }
             guard let a = area else { continue }
-            let box = boxes[min(i, boxes.count - 1)].insetBy(dx: 10, dy: 10)
-            let usable = CGRect(x: box.minX, y: box.minY, width: box.width, height: max(10, box.height - labelSize * 1.6))
+            let usable = boxRects[min(i, boxRects.count - 1)].insetBy(dx: 12, dy: 12)
             let cosLat = CGFloat(cos(Double(a.midY) * .pi / 180))
             let wDeg = max(a.width * cosLat, 0.0001), hDeg = max(a.height, 0.0001)
             let scale = min(usable.width / wDeg, usable.height / hDeg)
             let ox = usable.minX + (usable.width - wDeg * scale) / 2
             let oy = usable.minY + (usable.height - hDeg * scale) / 2
-            fits[g] = Fit(area: a, cosLat: cosLat, scale: scale, ox: ox, oy: oy)
-            shapeRects[g] = CGRect(x: ox, y: oy, width: wDeg * scale, height: hDeg * scale)
+            let fit = Fit(area: a, cosLat: cosLat, scale: scale, ox: ox, oy: oy)
+            for g in cluster { fits[g] = fit }
         }
 
         func ring(_ line: MapLine, _ fit: Fit) -> Path {
@@ -482,16 +525,24 @@ struct RouteMap: View {
             return path
         }
 
-        // 県の形（塗り＋輪郭）
+        // 県の形（まとまりごとに影を付けて、県ごとに色を変える）
+        for cluster in clusters {
+            var outline = Path()
+            for g in cluster {
+                guard let fit = fits[g] else { continue }
+                for line in lines where line.group == g { outline.addPath(ring(line, fit)) }
+            }
+            var shadowCtx = ctx
+            shadowCtx.addFilter(.shadow(color: .black.opacity(0.25), radius: 4, x: 1, y: 3))
+            shadowCtx.fill(outline, with: .color(.white.opacity(0.9)), style: FillStyle(eoFill: true))
+        }
         for (i, g) in groups.enumerated() {
             guard let fit = fits[g] else { continue }
             var path = Path()
             for line in lines where line.group == g {
                 path.addPath(ring(line, fit))
             }
-            var shadowCtx = ctx
-            shadowCtx.addFilter(.shadow(color: .black.opacity(0.18), radius: 3, x: 0, y: 2))
-            shadowCtx.fill(path, with: .color(NoteInk.fills[i % NoteInk.fills.count]), style: FillStyle(eoFill: true))
+            ctx.fill(path, with: .color(NoteInk.fills[i % NoteInk.fills.count]), style: FillStyle(eoFill: true))
             ctx.stroke(path, with: .color(NoteInk.ink), style: StrokeStyle(lineWidth: 1.8, lineJoin: .round))
 
             // 県の中の湖
@@ -501,17 +552,19 @@ struct RouteMap: View {
                 guard fit.area.contains(CGPoint(x: c.longitude, y: c.latitude)),
                       MapData.prefectureGroup(at: c, lines: lines) == g else { continue }
                 let lake = ring(line, fit)
-                ctx.fill(lake, with: .color(paper))
+                ctx.fill(lake, with: .color(Color(red: 0.86, green: 0.93, blue: 0.98)))
                 ctx.stroke(lake, with: .color(NoteInk.ink), style: StrokeStyle(lineWidth: 1.2, lineJoin: .round))
             }
+        }
 
-            // 県の名前（手書き風）
-            if let r = shapeRects[g], let name = groupName[g] {
-                ctx.draw(Text(name)
-                            .font(FontStore.shared.font(font, size: labelSize))
-                            .foregroundColor(NoteInk.ink),
-                         at: CGPoint(x: r.midX, y: r.maxY + labelSize * 0.8))
-            }
+        // 県の名前（手書き風、県の真ん中あたり）
+        for g in groups {
+            guard let fit = fits[g], let ga = groupAreas[g], let name = groupName[g] else { continue }
+            let q = fit.pt(ga.midX, ga.midY)
+            ctx.draw(Text(name)
+                        .font(FontStore.shared.font(font, size: labelSize))
+                        .foregroundColor(NoteInk.ink),
+                     at: CGPoint(x: q.x, y: q.y + labelSize * 0.9))
         }
 
         // 撮影地の点の位置（撮影順）
@@ -605,6 +658,7 @@ struct PhotoGrid: View {
     let trip: Trip
     let photos: [TripPhoto]
     let size: CGSize
+    let pinned: Bool
     let onTap: ((TripPhoto) -> Void)?
 
     var body: some View {
@@ -622,7 +676,7 @@ struct PhotoGrid: View {
             ForEach(Array(photos.enumerated()), id: \.element.id) { index, photo in
                 let col = index % cols
                 let row = index / cols
-                PhotoTile(image: TripStore.shared.thumbnail(trip.id, photo), number: index + 1, side: card)
+                PhotoTile(image: TripStore.shared.thumbnail(trip.id, photo), number: index + 1, side: card, pinned: pinned)
                     .contentShape(Rectangle())
                     .onTapGesture { onTap?(photo) }
                     .position(x: cellW * (CGFloat(col) + 0.5),
@@ -638,6 +692,7 @@ struct PhotoTile: View {
     let image: UIImage?
     let number: Int
     let side: CGFloat
+    var pinned = false
 
     var body: some View {
         let badge = max(18, side * 0.13)
@@ -661,6 +716,11 @@ struct PhotoTile: View {
                 .frame(width: badge, height: badge)
                 .background(Circle().fill(NoteInk.red))
                 .offset(x: -badge * 0.3, y: -badge * 0.3)
+
+            if pinned {
+                PushPin(size: max(14, side * 0.1))
+                    .offset(x: side / 2 - max(14, side * 0.1) / 2, y: -max(14, side * 0.1) * 0.35)
+            }
         }
         .frame(width: side, height: side)
     }

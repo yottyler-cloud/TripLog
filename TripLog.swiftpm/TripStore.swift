@@ -25,10 +25,11 @@ struct TripPhoto: Codable, Identifiable, Equatable {
 
 // 紙の色
 enum PaperColor: Int, CaseIterable {
-    case kraft, cream, white, sky, sakura
+    case cork, kraft, cream, white, sky, sakura
 
     var name: String {
         switch self {
+        case .cork: return "コルクボード"
         case .kraft: return "黄色"
         case .cream: return "クリーム"
         case .white: return "白"
@@ -37,8 +38,11 @@ enum PaperColor: Int, CaseIterable {
         }
     }
 
+    var isCork: Bool { self == .cork }
+
     var color: Color {
         switch self {
+        case .cork: return Color(red: 0.80, green: 0.62, blue: 0.42)
         case .kraft: return Color(red: 0.93, green: 0.81, blue: 0.38)
         case .cream: return Color(red: 0.97, green: 0.95, blue: 0.91)
         case .white: return Color(white: 0.99)
@@ -67,7 +71,7 @@ struct Trip: Codable, Identifiable, Equatable {
     ]
 
     var coverColor: Color { Self.coverColors[coverIndex % Self.coverColors.count] }
-    var paper: PaperColor { PaperColor(rawValue: paperIndex) ?? .kraft }
+    var paper: PaperColor { PaperColor(rawValue: paperIndex) ?? .cork }
     var font: HandFont { HandFont(rawValue: fontName) ?? .klee }
 
     // 撮影日時の順に並べた写真

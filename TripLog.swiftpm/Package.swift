@@ -18,8 +18,8 @@ let package = Package(
             targets: ["AppModule"],
             bundleIdentifier: "com.yottyler.TripLog",
             teamIdentifier: "",
-            displayVersion: "0.1",
-            bundleVersion: "1",
+            displayVersion: "0.2",
+            bundleVersion: "2",
             appIcon: .placeholder(icon: .map),
             accentColor: .presetColor(.blue),
             supportedDeviceFamilies: [
