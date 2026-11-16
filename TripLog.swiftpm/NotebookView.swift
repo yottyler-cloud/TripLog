@@ -268,8 +268,10 @@ struct NotebookView: View {
             // タッチした写真を大きく
             if let id = selectedID, let index = sorted.firstIndex(where: { $0.id == id }) {
                 let photo = sorted[index]
-                EnlargedPhoto(image: store.thumbnail(tripID, photo), number: index + 1, photo: photo,
-                              font: trip.font,
+                EnlargedPhoto(image: store.thumbnail(tripID, photo), number: index + 1, total: sorted.count,
+                              photo: photo, font: trip.font,
+                              onPrev: index > 0 ? { selectedID = sorted[index - 1].id } : nil,
+                              onNext: index < sorted.count - 1 ? { selectedID = sorted[index + 1].id } : nil,
                               onRemove: { removing = photo },
                               onClose: { selectedID = nil })
                     .frame(width: overlay.width, height: overlay.height)
@@ -503,11 +505,24 @@ struct RouteMap: View {
         }
         guard !groups.isEmpty else { return L }
 
-        // 県ごとの範囲
+        // 県ごとの範囲（遠く離れた小さな島は入れず、本土を中心にする）
+        var largest: [Int: CGFloat] = [:]
+        for line in lines where !line.isLake {
+            let a = (line.maxX - line.minX) * (line.maxY - line.minY)
+            largest[line.group] = max(largest[line.group] ?? 0, a)
+        }
         var groupAreas: [Int: CGRect] = [:]
         for line in lines where !line.isLake {
+            let a = (line.maxX - line.minX) * (line.maxY - line.minY)
+            guard a >= (largest[line.group] ?? 0) * 0.08 else { continue }
             let b = CGRect(x: line.minX, y: line.minY, width: line.maxX - line.minX, height: line.maxY - line.minY)
             groupAreas[line.group] = groupAreas[line.group]?.union(b) ?? b
+        }
+        // 島で撮った写真があれば、その場所も範囲に入れる
+        for p in photos {
+            guard let g = photoGroup[p.id], let c = p.coordinate else { continue }
+            let spot = CGRect(x: c.longitude - 0.03, y: c.latitude - 0.03, width: 0.06, height: 0.06)
+            groupAreas[g] = groupAreas[g]?.union(spot) ?? spot
         }
 
         if let sel = selectedID, let target = photoGroup[sel], let targetArea = groupAreas[target] {
@@ -635,7 +650,11 @@ struct RouteMap: View {
         func groupPath(_ g: Int) -> Path {
             var path = Path()
             guard let fit = L.fits[g] else { return path }
-            for line in lines where line.group == g { path.addPath(ring(line, fit)) }
+            let near = fit.area.insetBy(dx: -fit.area.width * 0.3, dy: -fit.area.height * 0.3)
+            for line in lines where line.group == g {
+                let box = CGRect(x: line.minX, y: line.minY, width: line.maxX - line.minX, height: line.maxY - line.minY)
+                if near.intersects(box) { path.addPath(ring(line, fit)) }
+            }
             return path
         }
 
@@ -874,10 +893,15 @@ struct PhotoTile: View {
 struct EnlargedPhoto: View {
     let image: UIImage?
     let number: Int
+    let total: Int
     let photo: TripPhoto
     let font: HandFont
+    let onPrev: (() -> Void)?
+    let onNext: (() -> Void)?
     let onRemove: () -> Void
     let onClose: () -> Void
+
+    @State private var dragX: CGFloat = 0
 
     var caption: String {
         var parts: [String] = []
@@ -899,15 +923,36 @@ struct EnlargedPhoto: View {
                 .onTapGesture { onClose() }
 
             VStack(alignment: .leading, spacing: 12) {
+                // 左右にスワイプで前後の写真へ
                 ZStack {
                     Color(white: 0.9)
                     if let image {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFit()
+                            .offset(x: dragX)
                     }
                 }
                 .frame(maxHeight: .infinity)
+                .clipped()
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 15)
+                        .onChanged { v in
+                            let x = v.translation.width
+                            // 端の写真では動きを小さくする
+                            dragX = (x < 0 && onNext == nil) || (x > 0 && onPrev == nil) ? x * 0.25 : x
+                        }
+                        .onEnded { v in
+                            let x = v.translation.width
+                            if x < -60, let onNext {
+                                onNext()
+                            } else if x > 60, let onPrev {
+                                onPrev()
+                            }
+                            withAnimation(.easeOut(duration: 0.2)) { dragX = 0 }
+                        }
+                )
 
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text("\(number)")
@@ -930,6 +975,24 @@ struct EnlargedPhoto: View {
                         Label("ノートから外す", systemImage: "trash")
                     }
                     .buttonStyle(.bordered)
+                    Spacer()
+                    Button {
+                        onPrev?()
+                    } label: {
+                        Image(systemName: "chevron.left")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(onPrev == nil)
+                    Text("\(number) / \(total)")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(NoteInk.ink2)
+                    Button {
+                        onNext?()
+                    } label: {
+                        Image(systemName: "chevron.right")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(onNext == nil)
                     Spacer()
                     Button {
                         onClose()
